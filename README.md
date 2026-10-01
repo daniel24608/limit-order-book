@@ -9,13 +9,13 @@ A multi-threaded limit order book and matching engine in C++17.
 
 ## Interactive demo
 
-[`docs/index.html`](docs/index.html) is a single-file visual walkthrough of the engine:
+**[Open the live demo](https://daniel24608.github.io/limit-order-book/)**, a single-file visual walkthrough of the engine ([`docs/index.html`](docs/index.html)):
 
 - **Order book**: a depth ladder showing each price level's FIFO queue, a step-by-step scenario covering price-time priority, partial fills, cancels and market orders, plus a form for sending your own orders and a random order flow
 - **Pipeline**: an animated 16-slot model of the SPSC ring buffer with adjustable producer and consumer rates
 - **Benchmarks**: throughput and latency charts from the results below
 
-The page runs a JavaScript port of the `OrderBook` matching logic. To view it, open the file in a browser, or enable GitHub Pages for this repo with the `/docs` folder as the source.
+The page runs a JavaScript port of the `OrderBook` matching logic. It has no build step or dependencies, so you can also open the file directly in a browser.
 
 ## Build and run
 
