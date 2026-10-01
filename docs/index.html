@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Interactive walkthrough of a C++17 limit order book and matching engine: price-time matching, a lock-free SPSC ring buffer, and benchmark results.">
+<title>Order Book Walkthrough</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f2f3f6; --surface:#ffffff; --sunk:#e9ebf0; --ink:#161a22; --ink2:#3e4555; --muted:#667085; --line:#dadee6;
+  --bid:#2f6bd0; --bid-soft:#dde7f8; --ask:#c96a12; --ask-soft:#f7e6d4;
+  --accent:#5b3fc4; --accent-soft:#e8e3fa; --flash:#f3d34a; --bad:#b42318;
+  --display:"Archivo","Arial Narrow",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0f1217; --surface:#14171d; --sunk:#1b1f27; --ink:#e7eaf0; --ink2:#c2c8d4; --muted:#949db0; --line:#2a303b;
+    --bid:#5b8ef0; --bid-soft:#1c2a45; --ask:#cc7a26; --ask-soft:#3a2816;
+    --accent:#a08cf2; --accent-soft:#2a2350; --flash:#c9a92a; --bad:#f07a6e;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f1217; --surface:#14171d; --sunk:#1b1f27; --ink:#e7eaf0; --ink2:#c2c8d4; --muted:#949db0; --line:#2a303b;
+  --bid:#5b8ef0; --bid-soft:#1c2a45; --ask:#cc7a26; --ask-soft:#3a2816;
+  --accent:#a08cf2; --accent-soft:#2a2350; --flash:#c9a92a; --bad:#f07a6e;
+}
+*{box-sizing:border-box}
+html{color-scheme:light}
+body{margin:0}
+img{max-width:100%}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--body);padding-inline:16px;padding-block:28px 64px}
+.wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:44px}
+h1,h2,h3{font-family:var(--display);font-stretch:85%;text-wrap:balance;margin:0;line-height:1.1}
+h1{font-size:clamp(30px,5vw,46px);font-weight:800;letter-spacing:-.01em}
+h2{font-size:26px;font-weight:700}
+h3{font-size:17px;font-weight:700}
+p{margin:0}
+.mono,code{font-family:var(--mono);font-variant-numeric:tabular-nums}
+code{font-size:.88em;background:var(--sunk);padding:1px 5px;border-radius:4px}
+.eyebrow{font:600 11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+header{display:flex;flex-direction:column;gap:12px;max-width:760px}
+header p{color:var(--ink2);font-size:16.5px}
+.facts{display:flex;flex-wrap:wrap;gap:8px 18px;font:500 12.5px var(--mono);color:var(--muted)}
+.facts b{color:var(--ink);font-weight:600}
+section{display:flex;flex-direction:column;gap:18px}
+.sechead{display:flex;flex-direction:column;gap:6px;max-width:720px}
+.sechead p{color:var(--ink2)}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px}
+button,select,input{font:inherit;color:inherit}
+button{cursor:pointer;border:1px solid var(--line);background:var(--surface);border-radius:7px;padding:7px 13px;font-weight:500;font-size:14px}
+button:hover:not(:disabled){border-color:var(--ink2)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+select,input{border:1px solid var(--line);background:var(--surface);border-radius:7px;padding:6px 8px;font-size:14px;min-width:0}
+
+/* ---------- order book ---------- */
+.bookgrid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:18px;align-items:start}
+@media (max-width:860px){.bookgrid{grid-template-columns:1fr}}
+.ladder-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.legend{display:flex;gap:14px;font-size:12.5px;color:var(--muted);flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.ladder{display:flex;flex-direction:column;gap:3px}
+.row{display:grid;grid-template-columns:44px 82px 52px minmax(0,1fr);align-items:center;gap:10px;min-height:30px;padding:2px 6px;border-radius:6px;transition:background .5s}
+.row.touched{background:var(--accent-soft)}
+.row .side{font:600 10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.row.ask .side{color:var(--ask)} .row.bid .side{color:var(--bid)}
+.row .px{font:600 14px var(--mono);font-variant-numeric:tabular-nums}
+.row .qty{font:500 13px var(--mono);color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.track{display:flex;gap:2px;height:24px;min-width:0}
+.seg{height:100%;border-radius:2px;display:flex;align-items:center;padding:0 6px;font:500 11px var(--mono);overflow:hidden;white-space:nowrap;min-width:3px;color:var(--ink);transition:width .35s ease}
+.row.ask .seg{background:var(--ask-soft);box-shadow:inset 0 0 0 1px var(--ask)}
+.row.bid .seg{background:var(--bid-soft);box-shadow:inset 0 0 0 1px var(--bid)}
+.row .seg:last-child{border-radius:2px 4px 4px 2px}
+.seg.hit{background:var(--flash)!important;color:#1a1600}
+.seg.fresh{box-shadow:inset 0 0 0 2px var(--accent)!important}
+.more{font:500 11px var(--mono);color:var(--muted);align-self:center;padding-left:4px}
+.spread{display:grid;grid-template-columns:44px 82px 52px minmax(0,1fr);gap:10px;padding:6px;border-block:1px dashed var(--line);margin-block:4px;font:500 12px var(--mono);color:var(--muted)}
+.spread b{color:var(--ink);font-weight:600}
+.empty{padding:8px 6px;font-size:13px;color:var(--muted);font-style:italic}
+.qhint{display:flex;justify-content:space-between;font:500 10.5px var(--mono);color:var(--muted);padding-left:204px;margin-top:6px;letter-spacing:.04em}
+@media (max-width:520px){
+  .row,.spread{grid-template-columns:30px 66px 40px minmax(0,1fr);gap:6px}
+  .row .px{font-size:12.5px}.row .side{font-size:9.5px}
+  .qhint{padding-left:154px}
+}
+
+.side-col{display:flex;flex-direction:column;gap:18px}
+.step-top{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.dots{display:flex;gap:5px}
+.dots span{width:18px;height:4px;border-radius:2px;background:var(--line)}
+.dots span.on{background:var(--accent)}
+.step h3{margin:10px 0 8px}
+.step p{color:var(--ink2);font-size:14.5px}
+.step .req{margin-top:12px;font:500 13px var(--mono);background:var(--sunk);border-radius:6px;padding:8px 10px;overflow-x:auto;white-space:nowrap}
+.fills{margin-top:10px;display:flex;flex-direction:column;gap:3px;font:13px var(--mono)}
+.fills div{display:flex;gap:8px;flex-wrap:wrap}
+.fills .note{color:var(--muted)}
+.nav{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+.nav .sp{flex:1}
+.entry{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.entry label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.entry .full{grid-column:1/-1}
+.seg-toggle{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg-toggle button{flex:1;border:0;border-radius:0;padding:6px 8px;background:transparent}
+.seg-toggle button[aria-pressed="true"].buy{background:var(--bid);color:#fff}
+.seg-toggle button[aria-pressed="true"].sell{background:var(--ask);color:#fff}
+.seg-toggle button[aria-pressed="true"].neutral{background:var(--ink);color:var(--bg)}
+.msg{font-size:13px;min-height:20px;color:var(--ink2)}
+.msg.err{color:var(--bad)}
+.flow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:14px;margin-top:4px}
+.flow small{color:var(--muted);font-size:12.5px;flex:1;min-width:180px}
+.tape{max-height:230px;overflow:auto;font:12.5px var(--mono);font-variant-numeric:tabular-nums}
+.tape table{width:100%;border-collapse:collapse}
+.tape th{text-align:left;font:600 10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:4px 6px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--surface)}
+.tape td{padding:4px 6px;border-bottom:1px solid var(--sunk)}
+.tape td.r,.tape th.r{text-align:right}
+.tape .b{color:var(--bid)} .tape .s{color:var(--ask)}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
+.stats div{display:flex;flex-direction:column;gap:2px}
+.stats span{font-size:11px;color:var(--muted)}
+.stats b{font:600 15px var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------- pipeline ---------- */
+.pipe{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:18px;align-items:start}
+@media (max-width:860px){.pipe{grid-template-columns:1fr}}
+.ringbox{overflow-x:auto}
+.ringbox svg{display:block;width:100%;max-width:640px;height:auto;margin:0 auto}
+.ctrl{display:flex;flex-direction:column;gap:14px}
+.slider{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:13px}
+.slider input{grid-column:1/-1;width:100%;accent-color:var(--accent);padding:0;border:0}
+.slider output{font:600 13px var(--mono)}
+.counters{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font:13px var(--mono);background:var(--sunk);border-radius:8px;padding:12px 14px;font-variant-numeric:tabular-nums}
+.counters dt{color:var(--muted)} .counters dd{margin:0}
+.counters .full{color:var(--bad);font-weight:600}
+.cachelines{display:flex;flex-direction:column;gap:6px;font:12px var(--mono)}
+.cl{display:flex;align-items:center;gap:8px}
+.cl .bar{flex:1;height:18px;border-radius:3px;border:1px solid var(--line);display:flex;overflow:hidden}
+.cl .bar span{width:12.5%;border-right:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--ink)}
+.cl .bar span:first-child{background:var(--accent-soft);border-right-color:var(--accent)}
+.cl em{font-style:normal;color:var(--muted);width:64px}
+.why{font-size:13.5px;color:var(--ink2)}
+
+/* ---------- benchmarks ---------- */
+.bench{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+@media (max-width:860px){.bench{grid-template-columns:1fr}}
+.chart h3{margin-bottom:4px}
+.chart .sub{font-size:13px;color:var(--muted);margin-bottom:10px}
+.chart svg{display:block;width:100%;height:auto;overflow:visible}
+.chart svg text{fill:var(--ink2);font-family:var(--mono);font-size:11px}
+.chart svg .lbl{fill:var(--ink);font-family:var(--body);font-size:12.5px}
+.chart svg .val{fill:var(--ink);font-weight:600}
+.chart svg .grid{stroke:var(--line);stroke-width:1}
+.chart svg .axis{stroke:var(--muted);stroke-width:1}
+.chart svg .bar{fill:var(--accent)}
+.chart svg .bar.dim{fill:var(--muted);opacity:.55}
+.chart svg .whisk{stroke:var(--ink);stroke-width:1.5}
+.chart svg .hit{fill:transparent;cursor:default}
+.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+@media (max-width:560px){.tiles{grid-template-columns:1fr}}
+.tile{display:flex;flex-direction:column;gap:6px}
+.tile .big{font:700 30px var(--display);font-stretch:85%;font-variant-numeric:tabular-nums}
+.tile .big s{color:var(--muted);text-decoration-thickness:2px;font-weight:600}
+.tile p{font-size:13.5px;color:var(--ink2)}
+.tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--bg);font:12px var(--mono);padding:6px 9px;border-radius:6px;z-index:10;max-width:260px}
+details{font-size:13px}
+details summary{cursor:pointer;color:var(--muted)}
+details table{border-collapse:collapse;margin-top:8px;font:12.5px var(--mono)}
+details td,details th{padding:4px 10px 4px 0;text-align:left;border-bottom:1px solid var(--line)}
+.source{font-size:12.5px;color:var(--muted)}
+footer{font-size:12.5px;color:var(--muted);border-top:1px solid var(--line);padding-top:16px}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="eyebrow">C++17 · price-time priority · lock-free SPSC pipeline</span>
+    <h1>Order Book Walkthrough</h1>
+    <p>An interactive tour of the limit order book and matching engine. The book below runs the same matching rules as <code>OrderBook.cpp</code>, ported to the browser: step through a guided scenario, then send your own orders or turn on a random order flow.</p>
+    <div class="facts"><span><b>37</b> unit tests</span><span><b>TSan</b> clean</span><span><b>~14.0M</b> req/s matching only</span><span><b>~6.5–6.8M</b> req/s full pipeline</span><span>p50 latency <b>250 ns</b></span></div>
+  </header>
+
+  <!-- 1. ORDER BOOK -->
+  <section id="book">
+    <div class="sechead">
+      <span class="eyebrow">Part 1 · The order book</span>
+      <h2>Price first, then time</h2>
+      <p>Each row is one price level. Its bar is the FIFO queue at that price: one segment per resting order, oldest on the left, width proportional to open quantity. Prices are integer ticks (1 tick = $0.01).</p>
+    </div>
+    <div class="bookgrid">
+      <div class="panel">
+        <div class="ladder-head">
+          <h3>Depth ladder</h3>
+          <div class="legend"><span><i style="background:var(--ask-soft);box-shadow:inset 0 0 0 1px var(--ask)"></i>Ask (sell)</span><span><i style="background:var(--bid-soft);box-shadow:inset 0 0 0 1px var(--bid)"></i>Bid (buy)</span><span><i style="background:var(--flash)"></i>Partly filled</span><span><i style="box-shadow:inset 0 0 0 2px var(--accent)"></i>Just rested</span></div>
+        </div>
+        <div class="ladder" id="ladder" aria-live="polite"></div>
+        <div class="qhint"><span>← front of queue (trades first)</span><span>back →</span></div>
+        <div class="stats">
+          <div><span>Best bid</span><b id="sBid">—</b></div>
+          <div><span>Best ask</span><b id="sAsk">—</b></div>
+          <div><span>Resting orders</span><b id="sCount">0</b></div>
+          <div><span>Trades</span><b id="sTrades">0</b></div>
+        </div>
+      </div>
+
+      <div class="side-col">
+        <div class="panel step" id="step">
+          <div class="step-top"><span class="eyebrow" id="stepNo">Step 1 of 7</span><div class="dots" id="dots"></div></div>
+          <h3 id="stepTitle"></h3>
+          <p id="stepBody"></p>
+          <div class="req" id="stepReq" hidden></div>
+          <div class="fills" id="stepFills"></div>
+          <div class="nav">
+            <button id="back">Back</button>
+            <button id="next" class="primary">Next step</button>
+            <span class="sp"></span>
+            <button id="reset">Reset book</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3 style="margin-bottom:12px">Send an order</h3>
+          <form class="entry" id="entry" novalidate>
+            <div class="full seg-toggle" role="group" aria-label="Request type">
+              <button type="button" class="neutral" data-type="limit" aria-pressed="true">Limit</button>
+              <button type="button" class="neutral" data-type="market" aria-pressed="false">Market</button>
+              <button type="button" class="neutral" data-type="cancel" aria-pressed="false">Cancel</button>
+            </div>
+            <div class="full seg-toggle" role="group" aria-label="Side" id="sideGroup">
+              <button type="button" class="buy" data-side="B" aria-pressed="true">Buy</button>
+              <button type="button" class="sell" data-side="S" aria-pressed="false">Sell</button>
+            </div>
+            <label id="pxWrap">Price ($)<input id="fPrice" type="number" step="0.01" value="100.01"></label>
+            <label id="qtyWrap">Quantity<input id="fQty" type="number" step="10" min="0" value="150"></label>
+            <label id="idWrap" class="full" hidden>Order id to cancel<input id="fId" type="number" min="1" value="6"></label>
+            <button class="full primary" type="submit" id="submit">Submit order</button>
+            <div class="full msg" id="msg"></div>
+          </form>
+          <div class="flow">
+            <button id="flowBtn">Start random flow</button>
+            <small>Benchmark mix: 70% limit (a third aggressive), 25% cancel, 5% market.</small>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="ladder-head"><h3>Trade tape</h3><span class="legend">Every trade prints at the resting order's price</span></div>
+      <div class="tape"><table><thead><tr><th>#</th><th>Buy id</th><th>Sell id</th><th class="r">Price</th><th class="r">Qty</th><th>Aggressor</th></tr></thead><tbody id="tape"></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- 2. PIPELINE -->
+  <section id="pipeline">
+    <div class="sechead">
+      <span class="eyebrow">Part 2 · The two-thread pipeline</span>
+      <h2>A ring buffer with no locks</h2>
+      <p>The ingestion thread pushes requests into <code>SpscQueue</code>; the matching thread pops them and owns the book alone, so the book needs no mutex. The real queue holds 65,536 slots. This one holds 16 so you can watch it fill. Slow the consumer down to see <code>tryPush</code> start returning false.</p>
+    </div>
+    <div class="pipe">
+      <div class="panel ringbox"><svg id="ring" viewBox="0 0 640 380" role="img" aria-label="Ring buffer with 16 slots between a producer thread and a consumer thread"></svg></div>
+      <div class="panel ctrl">
+        <div class="slider"><label for="pRate">Producer (ingestion) rate</label><output id="pOut"></output><input id="pRate" type="range" min="0" max="16" step="0.5" value="4"></div>
+        <div class="slider"><label for="cRate">Consumer (matching) rate</label><output id="cOut"></output><input id="cRate" type="range" min="0" max="16" step="0.5" value="5"></div>
+        <div class="nav" style="margin-top:0"><button id="pipeToggle">Pause</button><button id="burst">Burst 12 requests</button></div>
+        <dl class="counters">
+          <dt>tail_</dt><dd id="cTail">0</dd>
+          <dt>head_</dt><dd id="cHead">0</dd>
+          <dt>size</dt><dd id="cSize">tail_ − head_ = 0</dd>
+          <dt>next slot</dt><dd id="cSlot">tail_ &amp; 15 = 0</dd>
+          <dt>push failed</dt><dd id="cFull">0</dd>
+        </dl>
+        <div class="cachelines">
+          <div class="cl"><em>line A</em><div class="bar"><span>head_</span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
+          <div class="cl"><em>line B</em><div class="bar"><span>tail_</span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
+        </div>
+        <p class="why">Each counter has one writer. <code>head_</code> and <code>tail_</code> sit on separate 64-byte cache lines (<code>alignas(64)</code>), so a write by one thread never invalidates the line the other thread is writing. A release store of <code>tail_</code> paired with an acquire load publishes each slot.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. BENCHMARKS -->
+  <section id="bench">
+    <div class="sechead">
+      <span class="eyebrow">Part 3 · Benchmarks</span>
+      <h2>How fast it runs</h2>
+      <p>Random mix of 70% limit, 25% cancel and 5% market orders against a book pre-filled with 20,000 resting orders. Median of 5 trials.</p>
+    </div>
+    <div class="bench">
+      <div class="panel chart">
+        <h3>Throughput</h3>
+        <div class="sub">Million requests per second (higher is better)</div>
+        <svg id="thru" viewBox="0 0 520 190"></svg>
+      </div>
+      <div class="panel chart">
+        <h3>Submit-to-processed latency</h3>
+        <div class="sub">At ~0.7M req/s offered load, log scale (lower is better)</div>
+        <svg id="lat" viewBox="0 0 520 190"></svg>
+      </div>
+    </div>
+    <div class="tiles">
+      <div class="panel tile"><span class="eyebrow">Fix 1 · pre-size the order-id hash map</span><div class="big"><s>8.5</s> → 14.0 M/s</div><p>Reserving <code>orderIndex_</code> up front removed multi-millisecond rehash stalls and roughly doubled single-thread throughput.</p></div>
+      <div class="panel tile"><span class="eyebrow">Fix 2 · busy-poll before yield()</span><div class="big"><s>420</s> → 250 ns</div><p>Spinning briefly on an empty queue before yielding the CPU cut median latency by about 40%.</p></div>
+    </div>
+    <details>
+      <summary>Show benchmark numbers as a table</summary>
+      <table>
+        <tr><th>Metric</th><th>Result</th></tr>
+        <tr><td>Matching only, before hash-map pre-sizing</td><td>~8.5 M req/s</td></tr>
+        <tr><td>Matching only (1 thread, no queue)</td><td>~14.0 M req/s</td></tr>
+        <tr><td>Full pipeline (2 threads)</td><td>~6.5–6.8 M req/s</td></tr>
+        <tr><td>Latency p50</td><td>250 ns</td></tr>
+        <tr><td>Latency p90</td><td>~750 ns</td></tr>
+        <tr><td>Latency p99</td><td>~21–28 µs</td></tr>
+      </table>
+    </details>
+    <p class="source">Measured on an Apple Silicon MacBook Pro inside a 4-vCPU Linux VM, GCC 11, <code>-O3</code>. The p99 tail is mostly heap allocation for new resting orders plus vCPU scheduling in the VM.</p>
+  </section>
+
+  <footer>The in-page book is a JavaScript port of <code>OrderBook::addLimitOrder</code>, <code>addMarketOrder</code> and <code>cancelOrder</code>; it validates zero quantity, non-positive price and duplicate ids the same way. Run <code>make test</code>, <code>make tsan</code> and <code>make bench</code> for the real thing.</footer>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const fmt = t => '$' + (t / 100).toFixed(2);
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ================= Order book (port of OrderBook.cpp) ================= */
+class Book {
+  constructor() { this.bids = new Map(); this.asks = new Map(); this.index = new Map(); }
+  keys(side) { // bids: std::greater (best = highest), asks: std::less (best = lowest)
+    const m = side === 'B' ? this.bids : this.asks;
+    return [...m.keys()].sort((a, b) => side === 'B' ? b - a : a - b);
+  }
+  best(side) { const k = this.keys(side); return k.length ? k[0] : null; }
+  match(inc, oppSide, crosses, out) {
+    const m = oppSide === 'B' ? this.bids : this.asks;
+    while (inc.qty > 0 && m.size) {
+      const px = this.best(oppSide);
+      if (!crosses(px)) break;
+      const level = m.get(px);
+      while (inc.qty > 0 && level.length) {
+        const r = level[0];
+        const q = Math.min(inc.qty, r.qty);
+        out.trades.push({ buy: inc.side === 'B' ? inc.id : r.id, sell: inc.side === 'B' ? r.id : inc.id, px, qty: q, aggr: inc.side });
+        inc.qty -= q; r.qty -= q;
+        out.touched.add(px + oppSide);
+        if (r.qty === 0) { this.index.delete(r.id); level.shift(); out.filled.push(r.id); }
+        else out.partial.add(r.id);
+      }
+      if (!level.length) m.delete(px);
+    }
+  }
+  rest(o) {
+    const m = o.side === 'B' ? this.bids : this.asks;
+    if (!m.has(o.px)) m.set(o.px, []);
+    m.get(o.px).push(o);
+    this.index.set(o.id, o);
+  }
+  newResult() { return { ok: true, trades: [], touched: new Set(), partial: new Set(), filled: [], rested: null, err: null }; }
+  limit(id, side, px, qty) {
+    const out = this.newResult();
+    if (!(qty > 0)) return { ...out, ok: false, err: 'Rejected: quantity must be greater than zero.' };
+    if (!(px > 0)) return { ...out, ok: false, err: 'Rejected: price must be positive.' };
+    if (this.index.has(id)) return { ...out, ok: false, err: `Rejected: order #${id} is already resting.` };
+    const inc = { id, side, px, qty };
+    if (side === 'B') this.match(inc, 'S', p => p <= px, out);
+    else this.match(inc, 'B', p => p >= px, out);
+    if (inc.qty > 0) { this.rest(inc); out.rested = inc; out.touched.add(px + side); }
+    return out;
+  }
+  market(id, side, qty) {
+    const out = this.newResult();
+    if (!(qty > 0)) return { ...out, ok: false, err: 'Rejected: quantity must be greater than zero.' };
+    const inc = { id, side, px: 0, qty };
+    this.match(inc, side === 'B' ? 'S' : 'B', () => true, out);
+    out.discarded = inc.qty; // unfilled remainder of a market order is dropped
+    return out;
+  }
+  cancel(id) {
+    const out = this.newResult();
+    const o = this.index.get(id);
+    if (!o) return { ...out, ok: false, err: `Order #${id} is not resting in the book.` };
+    const m = o.side === 'B' ? this.bids : this.asks;
+    const level = m.get(o.px);
+    level.splice(level.indexOf(o), 1);
+    if (!level.length) m.delete(o.px);
+    this.index.delete(id);
+    out.cancelled = o; out.touched.add(o.px + o.side);
+    return out;
+  }
+}
+
+/* ---------------- Guided scenario ---------------- */
+function seed(b) {
+  [[1,'S',10008,400],[2,'S',10005,200],[3,'S',10003,100],[4,'S',10003,150],[5,'S',10002,120],
+   [6,'B',10000,150],[7,'B',10000,100],[8,'B',9998,300],[9,'B',9997,200],[10,'B',9995,250]]
+   .forEach(([id, s, p, q]) => b.limit(id, s, p, q));
+}
+const steps = [
+  { title: 'A resting book', req: null, run: null,
+    body: 'Ten orders rest on the book. Bids live in a map sorted high-to-low and asks in a map sorted low-to-high, so begin() on either side is always the best price. Best bid $100.00, best ask $100.02: a two-tick spread. At $100.00 and $100.03, two orders share a level and queue in arrival order.' },
+  { title: 'Time priority at one price', req: 'Limit SELL #11 · 100 @ $100.03', run: b => b.limit(11, 'S', 10003, 100),
+    body: 'A new sell at $100.03 does not cross the best bid, so it rests. It joins the back of the $100.03 queue, behind #3 and #4, because they arrived first.' },
+  { title: 'An aggressive buy walks the book', req: 'Limit BUY #12 · 400 @ $100.03', run: b => b.limit(12, 'B', 10003, 400),
+    body: 'The buy crosses every ask at or below $100.03. It takes the best price first ($100.02), then works through the $100.03 queue oldest first: #3, #4, then 30 of #11. Each fill prints at the resting price, so the first 120 cost $100.02, not the buyer\'s $100.03 limit.' },
+  { title: 'The unfilled remainder rests', req: 'Limit SELL #13 · 300 @ $99.99', run: b => b.limit(13, 'S', 9999, 300),
+    body: 'The sell crosses both bids at $100.00 (250 shares). The next bid, $99.98, is below its $99.99 limit, so matching stops and the last 50 rest as a new best ask. The spread is now one tick.' },
+  { title: 'Cancel in O(1)', req: 'Cancel #8', run: b => b.cancel(8),
+    body: 'An unordered_map from order id to its list iterator finds #8 without scanning. Erasing it empties the $99.98 level, so the level is removed from the map too.' },
+  { title: 'A market order takes any price', req: 'Market SELL #14 · 600', run: b => b.market(14, 'S', 600),
+    body: 'A market sell matches bids at any price until it fills or the side runs out. Only 450 rest on the bid side, so the remaining 150 is discarded rather than resting. The bid side is now empty and bestBid() returns std::nullopt.' },
+  { title: 'Your turn', req: null, run: null,
+    body: 'Send your own orders with the form below, or start the random flow to watch the book churn with the benchmark\'s order mix. Reset book returns to step 1.' },
+];
+
+let book, stepIdx = 0, freePlay = false, trades = [], tradeNo = 0, nextId = 100, lastRes = null;
+
+function buildToStep(k) {
+  book = new Book(); seed(book); trades = []; tradeNo = 0; lastRes = null;
+  for (let i = 1; i <= k; i++) {
+    if (!steps[i].run) continue;
+    const r = steps[i].run(book);
+    logTrades(r.trades);
+    lastRes = r;
+  }
+  if (!steps[k].run) lastRes = null;
+}
+function logTrades(ts) { ts.forEach(t => trades.unshift({ n: ++tradeNo, ...t })); if (trades.length > 60) trades.length = 60; }
+
+/* ---------------- Rendering ---------------- */
+const MAXLV = 7, MAXSEG = 8;
+function renderLadder() {
+  const lad = $('ladder');
+  const askK = book.keys('S').slice(0, MAXLV).reverse();
+  const bidK = book.keys('B').slice(0, MAXLV);
+  const tot = l => l.reduce((s, o) => s + o.qty, 0);
+  let max = 1;
+  askK.forEach(p => max = Math.max(max, tot(book.asks.get(p))));
+  bidK.forEach(p => max = Math.max(max, tot(book.bids.get(p))));
+  const r = lastRes || { touched: new Set(), partial: new Set(), rested: null };
+  const row = (p, side) => {
+    const lv = side === 'S' ? book.asks.get(p) : book.bids.get(p);
+    const t = tot(lv);
+    const shown = lv.slice(0, MAXSEG);
+    const segs = shown.map(o => {
+      const cls = ['seg'];
+      if (r.partial.has(o.id)) cls.push('hit');
+      if (r.rested && r.rested.id === o.id) cls.push('fresh');
+      const w = Math.max(o.qty / max * 100, 1.5);
+      return `<div class="${cls.join(' ')}" style="width:${w}%" title="#${o.id} · ${o.qty} open">${o.qty / max > 0.09 ? '#' + o.id : ''}</div>`;
+    }).join('');
+    const more = lv.length > MAXSEG ? `<span class="more">+${lv.length - MAXSEG}</span>` : '';
+    return `<div class="row ${side === 'S' ? 'ask' : 'bid'}${r.touched.has(p + side) ? ' touched' : ''}"><span class="side">${side === 'S' ? 'ask' : 'bid'}</span><span class="px">${fmt(p)}</span><span class="qty">${t}</span><div class="track">${segs}${more}</div></div>`;
+  };
+  const bb = book.best('B'), ba = book.best('S');
+  const spread = bb != null && ba != null ? `<b>${ba - bb}</b> tick${ba - bb === 1 ? '' : 's'}` : '<b>—</b>';
+  lad.innerHTML =
+    (askK.length ? askK.map(p => row(p, 'S')).join('') : '<div class="empty">No asks resting</div>') +
+    `<div class="spread"><span></span><span>spread</span><span></span><span>${spread}</span></div>` +
+    (bidK.length ? bidK.map(p => row(p, 'B')).join('') : '<div class="empty">No bids resting (bestBid() = nullopt)</div>');
+  $('sBid').textContent = bb != null ? fmt(bb) : '—';
+  $('sAsk').textContent = ba != null ? fmt(ba) : '—';
+  $('sCount').textContent = book.index.size;
+  $('sTrades').textContent = tradeNo;
+}
+function renderTape() {
+  $('tape').innerHTML = trades.length ? trades.map(t =>
+    `<tr><td>${t.n}</td><td class="b">#${t.buy}</td><td class="s">#${t.sell}</td><td class="r">${fmt(t.px)}</td><td class="r">${t.qty}</td><td>${t.aggr === 'B' ? 'buyer' : 'seller'}</td></tr>`).join('')
+    : '<tr><td colspan="6" style="color:var(--muted)">No trades yet. Press Next step.</td></tr>';
+}
+function describe(r) {
+  if (!r) return '';
+  const lines = r.trades.map(t => {
+    const rid = t.aggr === 'B' ? t.sell : t.buy;
+    const full = r.filled.includes(rid);
+    return `<div><span>${t.qty} @ ${fmt(t.px)}</span><span class="note">vs #${rid}${full ? ' (filled, removed)' : ' (partly filled)'}</span></div>`;
+  });
+  if (r.rested) lines.push(`<div class="note">${r.rested.qty} rests at ${fmt(r.rested.px)} as #${r.rested.id}</div>`);
+  if (r.discarded) lines.push(`<div class="note">${r.discarded} unfilled, discarded</div>`);
+  if (r.cancelled) lines.push(`<div class="note">#${r.cancelled.id} removed (${r.cancelled.qty} @ ${fmt(r.cancelled.px)})</div>`);
+  return lines.join('');
+}
+function renderStep() {
+  const s = steps[stepIdx];
+  $('dots').innerHTML = steps.map((_, i) => `<span class="${i <= stepIdx && !freePlay ? 'on' : ''}"></span>`).join('');
+  if (freePlay) {
+    $('stepNo').textContent = 'Free play';
+    $('stepTitle').textContent = 'You are driving the book';
+    $('stepBody').textContent = 'The walkthrough is paused while you send orders. Reset book returns to step 1.';
+    $('stepReq').hidden = true;
+  } else {
+    $('stepNo').textContent = `Step ${stepIdx + 1} of ${steps.length}`;
+    $('stepTitle').textContent = s.title;
+    $('stepBody').textContent = s.body;
+    $('stepReq').hidden = !s.req; $('stepReq').textContent = s.req || '';
+  }
+  $('stepFills').innerHTML = describe(lastRes);
+  $('back').disabled = freePlay || stepIdx === 0;
+  $('next').disabled = freePlay || stepIdx === steps.length - 1;
+}
+function renderAll() { renderLadder(); renderTape(); renderStep(); }
+
+$('next').onclick = () => { stepIdx++; buildToStep(stepIdx); renderAll(); };
+$('back').onclick = () => { stepIdx--; buildToStep(stepIdx); renderAll(); };
+$('reset').onclick = () => { stopFlow(); freePlay = false; stepIdx = 0; buildToStep(0); setMsg(''); renderAll(); };
+
+/* ---------------- Order entry ---------------- */
+let fType = 'limit', fSide = 'B';
+document.querySelectorAll('[data-type]').forEach(b => b.onclick = () => {
+  fType = b.dataset.type;
+  document.querySelectorAll('[data-type]').forEach(x => x.setAttribute('aria-pressed', x === b));
+  $('pxWrap').hidden = fType !== 'limit';
+  $('qtyWrap').hidden = fType === 'cancel';
+  $('sideGroup').hidden = fType === 'cancel';
+  $('idWrap').hidden = fType !== 'cancel';
+  $('submit').textContent = fType === 'cancel' ? 'Cancel order' : 'Submit order';
+});
+document.querySelectorAll('[data-side]').forEach(b => b.onclick = () => {
+  fSide = b.dataset.side;
+  document.querySelectorAll('[data-side]').forEach(x => x.setAttribute('aria-pressed', x === b));
+});
+function setMsg(t, err) { $('msg').textContent = t; $('msg').className = 'full msg' + (err ? ' err' : ''); }
+function enterFree() { if (!freePlay) { freePlay = true; } }
+function apply(r) {
+  logTrades(r.trades); lastRes = r.ok ? r : lastRes; renderAll();
+}
+$('entry').addEventListener('submit', e => {
+  e.preventDefault(); enterFree();
+  let r;
+  if (fType === 'cancel') {
+    const id = parseInt($('fId').value, 10);
+    r = book.cancel(id);
+    if (r.ok) setMsg(`Cancelled #${id}.`);
+  } else {
+    const qty = Math.round(Number($('fQty').value));
+    const id = nextId;
+    if (fType === 'limit') r = book.limit(id, fSide, Math.round(Number($('fPrice').value) * 100), qty);
+    else r = book.market(id, fSide, qty);
+    if (r.ok) {
+      nextId++;
+      const filled = r.trades.reduce((s, t) => s + t.qty, 0);
+      setMsg(`#${id}: ${filled} filled in ${r.trades.length} trade${r.trades.length === 1 ? '' : 's'}` +
+        (r.rested ? `, ${r.rested.qty} resting.` : r.discarded ? `, ${r.discarded} discarded.` : '.'));
+    }
+  }
+  if (!r.ok) setMsg(r.err, true);
+  apply(r);
+});
+
+/* ---------------- Random flow (benchmark mix) ---------------- */
+let flowTimer = null;
+const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+function flowTick() {
+  const bb = book.best('B') ?? 9999, ba = book.best('S') ?? 10001;
+  const ids = [...book.index.keys()];
+  const roll = Math.random();
+  let r;
+  if ((roll < 0.25 || ids.length > 45) && ids.length) r = book.cancel(ids[rnd(0, ids.length - 1)]);
+  else if (roll < 0.30) r = book.market(nextId++, Math.random() < 0.5 ? 'B' : 'S', rnd(5, 25) * 10);
+  else {
+    const side = Math.random() < 0.5 ? 'B' : 'S';
+    const aggressive = Math.random() < 1 / 3;
+    let px;
+    if (side === 'B') px = aggressive ? ba + rnd(0, 2) : Math.min(bb, ba - 1) - rnd(0, 5);
+    else px = aggressive ? bb - rnd(0, 2) : Math.max(ba, bb + 1) + rnd(0, 5);
+    r = book.limit(nextId++, side, px, rnd(5, 30) * 10);
+  }
+  apply(r);
+}
+function stopFlow() { clearInterval(flowTimer); flowTimer = null; $('flowBtn').textContent = 'Start random flow'; }
+$('flowBtn').onclick = () => {
+  if (flowTimer) return stopFlow();
+  enterFree(); setMsg('');
+  if (!book.index.size) { book = new Book(); seed(book); }
+  flowTimer = setInterval(flowTick, 650);
+  $('flowBtn').textContent = 'Stop random flow';
+  flowTick();
+};
+
+buildToStep(0); renderAll();
+
+/* ================= Ring buffer ================= */
+const CAP = 16, MASK = CAP - 1;
+const svg = $('ring'), NS = 'http://www.w3.org/2000/svg';
+const cx = 320, cy = 190, R1 = 92, R2 = 140;
+const el = (n, a, parent = svg) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); parent.appendChild(e); return e; };
+const pol = (r, a) => [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+const slotEls = [], slotTxt = [];
+for (let i = 0; i < CAP; i++) {
+  const a0 = -Math.PI / 2 + i * 2 * Math.PI / CAP + 0.02, a1 = a0 + 2 * Math.PI / CAP - 0.04;
+  const [x0, y0] = pol(R2, a0), [x1, y1] = pol(R2, a1), [x2, y2] = pol(R1, a1), [x3, y3] = pol(R1, a0);
+  slotEls.push(el('path', { d: `M${x0},${y0} A${R2},${R2} 0 0 1 ${x1},${y1} L${x2},${y2} A${R1},${R1} 0 0 0 ${x3},${y3}Z`, style: 'fill:var(--sunk);stroke:var(--line);transition:fill .2s' }));
+  const am = (a0 + a1) / 2, [tx, ty] = pol((R1 + R2) / 2, am), [ix, iy] = pol(R2 + 12, am);
+  slotTxt.push(el('text', { x: tx, y: ty + 4, 'text-anchor': 'middle', style: 'font:600 11px var(--mono);fill:var(--ink)' }));
+  const it = el('text', { x: ix, y: iy + 3.5, 'text-anchor': 'middle', style: 'font:10px var(--mono);fill:var(--muted)' }); it.textContent = i;
+}
+el('text', { x: cx, y: cy - 6, 'text-anchor': 'middle', style: 'font:600 13px var(--mono);fill:var(--ink)' }).textContent = 'SpscQueue';
+const capTxt = el('text', { x: cx, y: cy + 14, 'text-anchor': 'middle', style: 'font:12px var(--mono);fill:var(--muted)' });
+// producer / consumer boxes
+const box = (x, label, sub) => {
+  el('rect', { x, y: 155, width: 120, height: 70, rx: 8, style: 'fill:var(--surface);stroke:var(--ink2)' });
+  el('text', { x: x + 60, y: 184, 'text-anchor': 'middle', style: 'font:600 13px var(--body);fill:var(--ink)' }).textContent = label;
+  el('text', { x: x + 60, y: 203, 'text-anchor': 'middle', style: 'font:11px var(--mono);fill:var(--muted)' }).textContent = sub;
+};
+box(6, 'Ingestion', 'producer');
+box(514, 'Matching', 'consumer');
+const tailMark = el('g', {}), headMark = el('g', {});
+const mark = (g, label, color) => {
+  el('line', { x1: 0, y1: 0, x2: 0, y2: 0, style: `stroke:${color};stroke-width:2.5` }, g);
+  el('circle', { r: 4, style: `fill:${color}` }, g);
+  el('text', { 'text-anchor': 'middle', style: `font:600 11px var(--mono);fill:${color}` }, g).textContent = label;
+};
+mark(tailMark, 'tail_', 'var(--bid)'); mark(headMark, 'head_', 'var(--ask)');
+const placeMark = (g, idx, rOut) => {
+  const a = -Math.PI / 2 + (idx + 0.5) * 2 * Math.PI / CAP;
+  const [x1, y1] = pol(R1 - 4, a), [x2, y2] = pol(R1 - 26, a), [tx, ty] = pol(R1 - 38, a);
+  const [ln, c, t] = g.children;
+  ln.setAttribute('x1', x2); ln.setAttribute('y1', y2); ln.setAttribute('x2', x1); ln.setAttribute('y2', y1);
+  c.setAttribute('cx', x1); c.setAttribute('cy', y1);
+  t.setAttribute('x', tx); t.setAttribute('y', ty + 4);
+};
+el('text', { x: 66, y: 248, 'text-anchor': 'middle', style: 'font:11px var(--mono);fill:var(--bid)' }).textContent = 'tryPush() →';
+el('text', { x: 574, y: 248, 'text-anchor': 'middle', style: 'font:11px var(--mono);fill:var(--ask)' }).textContent = '→ tryPop()';
+
+let head = 0, tail = 0, pushFail = 0, pAcc = 0, cAcc = 0, running = !reduced, last = performance.now(), failFlash = 0;
+function drawRing() {
+  for (let i = 0; i < CAP; i++) {
+    slotEls[i].style.fill = 'var(--sunk)'; slotTxt[i].textContent = '';
+  }
+  for (let k = head; k < tail; k++) {
+    const i = k & MASK;
+    slotEls[i].style.fill = 'var(--accent-soft)';
+    slotEls[i].style.stroke = 'var(--accent)';
+    slotTxt[i].textContent = 'r' + k;
+  }
+  for (let i = 0; i < CAP; i++) if (slotTxt[i].textContent === '') slotEls[i].style.stroke = 'var(--line)';
+  placeMark(tailMark, tail & MASK); placeMark(headMark, head & MASK);
+  const size = tail - head;
+  capTxt.textContent = `${size} / ${CAP}${size === CAP ? ' full' : ''}`;
+  capTxt.style.fill = size === CAP ? 'var(--bad)' : 'var(--muted)';
+  $('cTail').textContent = tail; $('cHead').textContent = head;
+  $('cSize').textContent = `tail_ − head_ = ${size}`;
+  $('cSlot').textContent = `tail_ & 15 = ${tail & MASK}`;
+  $('cFull').textContent = pushFail; $('cFull').className = failFlash > 0 ? 'full' : '';
+}
+function tryPush() { if (tail - head === CAP) { pushFail++; failFlash = 0.6; return false; } tail++; return true; }
+function tryPop() { if (head === tail) return false; head++; return true; }
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  if (running) {
+    const pr = +$('pRate').value, cr = +$('cRate').value;
+    pAcc += dt * pr; cAcc += dt * cr;
+    while (pAcc >= 1) { pAcc -= 1; if (!tryPush()) { pAcc = 0; break; } }
+    while (cAcc >= 1) { cAcc -= 1; if (!tryPop()) { cAcc = 0; break; } }
+    failFlash = Math.max(0, failFlash - dt);
+  }
+  drawRing();
+  requestAnimationFrame(frame);
+}
+const syncOut = () => { $('pOut').textContent = $('pRate').value + ' req/s'; $('cOut').textContent = $('cRate').value + ' req/s'; };
+$('pRate').oninput = syncOut; $('cRate').oninput = syncOut; syncOut();
+$('pipeToggle').textContent = running ? 'Pause' : 'Play';
+$('pipeToggle').onclick = () => { running = !running; $('pipeToggle').textContent = running ? 'Pause' : 'Play'; };
+$('burst').onclick = () => { for (let i = 0; i < 12; i++) tryPush(); };
+// start with a few items in flight so the still frame shows the idea
+for (let i = 0; i < 6; i++) tryPush(); tryPop(); tryPop();
+requestAnimationFrame(frame);
+
+/* ================= Benchmark charts ================= */
+const tip = $('tip');
+const showTip = (e, html) => { tip.innerHTML = html; tip.hidden = false; tip.style.left = Math.min(e.clientX + 12, innerWidth - 270) + 'px'; tip.style.top = (e.clientY + 14) + 'px'; };
+const hideTip = () => { tip.hidden = true; };
+function hbars(svgEl, rows, xOf, ticks, tickLabel) {
+  const L = 190, Rr = 500, top = 8, bh = 20, gap = 26;
+  const H = top + rows.length * (bh + gap) + 18;
+  svgEl.setAttribute('viewBox', `0 0 520 ${H}`);
+  const base = H - 22;
+  ticks.forEach(t => {
+    const x = xOf(t);
+    el('line', { x1: x, x2: x, y1: top - 4, y2: base, class: 'grid' }, svgEl);
+    el('text', { x, y: base + 15, 'text-anchor': 'middle' }, svgEl).textContent = tickLabel(t);
+  });
+  el('line', { x1: L, x2: L, y1: top - 4, y2: base, class: 'axis' }, svgEl);
+  rows.forEach((r, i) => {
+    const y = top + i * (bh + gap) + 4;
+    el('text', { x: L - 10, y: y + bh / 2 + 4, 'text-anchor': 'end', class: 'lbl' }, svgEl).textContent = r.label;
+    const x1 = xOf(r.v), w = Math.max(x1 - L, 4);
+    el('path', { d: `M${L},${y} H${L + w - 4} Q${L + w},${y} ${L + w},${y + 4} V${y + bh - 4} Q${L + w},${y + bh} ${L + w - 4},${y + bh} H${L}Z`, class: 'bar' + (r.dim ? ' dim' : '') }, svgEl);
+    let endX = x1;
+    if (r.lo != null) {
+      const a = xOf(r.lo), b = xOf(r.hi); endX = b;
+      el('line', { x1: a, x2: b, y1: y + bh / 2, y2: y + bh / 2, class: 'whisk' }, svgEl);
+      el('line', { x1: a, x2: a, y1: y + 5, y2: y + bh - 5, class: 'whisk' }, svgEl);
+      el('line', { x1: b, x2: b, y1: y + 5, y2: y + bh - 5, class: 'whisk' }, svgEl);
+    }
+    const vt = el('text', { x: Math.min(endX + 7, Rr + 14), y: y + bh / 2 + 4, class: 'val' }, svgEl); vt.textContent = r.text;
+    if (endX + 7 + r.text.length * 7 > 520) { vt.setAttribute('x', endX - 7); vt.setAttribute('text-anchor', 'end'); vt.style.fill = 'var(--surface)'; }
+    const hit = el('rect', { x: 0, y: y - gap / 2 + 2, width: 520, height: bh + gap - 4, class: 'hit' }, svgEl);
+    hit.addEventListener('mousemove', e => showTip(e, r.tip)); hit.addEventListener('mouseleave', hideTip);
+  });
+}
+// throughput, linear 0..16
+{
+  const L = 190, W = 300, xOf = v => L + v / 16 * W;
+  hbars($('thru'), [
+    { label: 'Matching only, before fix', v: 8.5, text: '8.5', dim: true, tip: 'Single thread, no queue, before pre-sizing the order-id hash map: ~8.5 M req/s' },
+    { label: 'Matching only (1 thread)', v: 14.0, text: '14.0', tip: 'Single thread, no queue: ~14.0 M req/s' },
+    { label: 'Full pipeline (2 threads)', v: 6.65, lo: 6.5, hi: 6.8, text: '6.5–6.8', tip: 'Ingestion + matching threads through the SPSC queue: ~6.5–6.8 M req/s (range across runs)' },
+  ], xOf, [0, 4, 8, 12, 16], t => t + 'M');
+}
+// latency, log 100ns..100µs
+{
+  const L = 190, W = 300, lg = Math.log10, xOf = v => L + (lg(v) - 2) / 3 * W;
+  hbars($('lat'), [
+    { label: 'p50', v: 250, text: '250 ns', tip: 'Median submit-to-processed latency: 250 ns' },
+    { label: 'p90', v: 750, text: '~750 ns', tip: '90th percentile: ~750 ns' },
+    { label: 'p99', v: 24500, lo: 21000, hi: 28000, text: '21–28 µs', tip: '99th percentile: ~21–28 µs. Dominated by malloc for new resting orders and vCPU scheduling.' },
+  ], xOf, [100, 1000, 10000, 100000], t => t < 1000 ? t + 'ns' : (t / 1000) + 'µs');
+}
+})();
+</script>
+</body>
+</html>
